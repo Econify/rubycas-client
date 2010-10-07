@@ -9,7 +9,7 @@ module CASClient
         @@client = nil
         @@log = nil
         @@fake_user = nil
-        @@fake_extra_attributes = nil
+        
         
         class << self
           def filter(controller)
@@ -18,12 +18,16 @@ module CASClient
             if @@fake_user
               controller.session[client.username_session_key] = @@fake_user
               controller.session[:casfilteruser] = @@fake_user
-              controller.session[client.extra_attributes_session_key] = @@fake_extra_attributes
               return true
             end
-            
-            
-            last_st = controller.session[:cas_last_valid_ticket]
+
+            if controller.session[:cas_last_valid_ticket]
+              last_st = ServiceTicket.new(controller.session[:cas_last_valid_ticket][:ticket],
+                                          controller.session[:cas_last_valid_ticket][:service])
+              last_st.is_valid = controller.session[:cas_last_valid_ticket][:is_valid]                            
+              last_st.is_validated  = controller.session[:cas_last_valid_ticket][:is_validated]     
+              last_st.response = ValidationResponseStub.new(controller.session[:cas_last_valid_ticket][:pgt_iou])                            
+            end
             
             if single_sign_out(controller)
               controller.send(:render, :text => "CAS Single-Sign-Out request intercepted.")
@@ -58,17 +62,16 @@ module CASClient
               st = last_st
               is_new_session = false
             end
-            
+          
             if st
               client.validate_service_ticket(st) unless st.has_been_validated?
               vr = st.response
-              
+              log.info "INSPECT #{st.response.inspect}"
               if st.is_valid?
                 if is_new_session
                   log.info("Ticket #{st.ticket.inspect} for service #{st.service.inspect} belonging to user #{vr.user.inspect} is VALID.")
                   controller.session[client.username_session_key] = vr.user.dup
                   controller.session[client.extra_attributes_session_key] = HashWithIndifferentAccess.new(vr.extra_attributes) if vr.extra_attributes
-                  
                   if vr.extra_attributes
                     log.debug("Extra user attributes provided along with ticket #{st.ticket.inspect}: #{vr.extra_attributes.inspect}.")
                   end
@@ -76,7 +79,7 @@ module CASClient
                   # RubyCAS-Client 1.x used :casfilteruser as it's username session key,
                   # so we need to set this here to ensure compatibility with configurations
                   # built around the old client.
-                  controller.session[:casfilteruser] = vr.user
+                  # controller.session[:casfilteruser] = vr.user
                   
                   if config[:enable_single_sign_out]
                     f = store_service_session_lookup(st, controller.request.session_options[:id] || controller.session.session_id)
@@ -86,8 +89,12 @@ module CASClient
               
                 # Store the ticket in the session to avoid re-validating the same service
                 # ticket with the CAS server.
-                controller.session[:cas_last_valid_ticket] = st
-                
+                controller.session[:cas_last_valid_ticket] = {:ticket => st.ticket, 
+                                                              :service => st.service,
+                                                              :is_valid => st.is_valid?,
+                                                              :is_validated => st.has_been_validated?}
+                                                              
+                 controller.session[:cas_last_valid_ticket].merge(:pgt_iou => st.response.pgt_iou) if st.response
                 if vr.pgt_iou
                   unless controller.session[:cas_pgt] && controller.session[:cas_pgt].ticket && controller.session[:cas_pgt].iou == vr.pgt_iou
                     log.info("Receipt has a proxy-granting ticket IOU. Attempting to retrieve the proxy-granting ticket...")
@@ -105,8 +112,7 @@ module CASClient
                     log.info("PGT is present in session and PGT IOU #{vr.pgt_iou} matches the saved PGT IOU.  Not retrieving new PGT.")
                   end
 
-                end
-                
+                end              
                 return true
               else
                 log.warn("Ticket #{st.ticket.inspect} failed validation -- #{vr.failure_code}: #{vr.failure_message}")
@@ -122,7 +128,6 @@ module CASClient
 
                 if use_gatewaying?
                   log.info "This CAS client is configured to use gatewaying, so we will permit the user to continue without authentication."
-                  controller.session[client.username_session_key] = nil
                   return true
                 else
                   log.warn "The CAS client is NOT configured to allow gatewaying, yet this request was gatewayed. Something is not right!"
@@ -149,11 +154,8 @@ module CASClient
           # with cucumber and other tools.
           # use like 
           #  CASClient::Frameworks::Rails::Filter.fake("homer")
-          # you can also fake extra attributes by including a second parameter
-          #  CASClient::Frameworks::Rails::Filter.fake("homer", {:roles => ['dad', 'husband']})
-          def fake(username, extra_attributes = nil)
+          def fake(username)
             @@fake_user = username
-            @@fake_extra_attributes = extra_attributes
           end
           
           def use_gatewaying?
@@ -237,6 +239,7 @@ module CASClient
           end
           
           def redirect_to_cas_for_authentication(controller)
+            
             redirect_url = login_url(controller)
             
             if use_gatewaying?
